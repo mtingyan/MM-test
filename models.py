@@ -9,7 +9,6 @@ class GNNEncoder(nn.Module):
         self,
         input_dim,
         hidden_dim,
-        output_dim,
         num_layers=2,
         edge_feature_dim=None,
         backbone="GCNConv",
@@ -94,6 +93,22 @@ class NodeRegressor(torch.nn.Module):
         return self.regressor(h).squeeze(-1)
 
 
+class CombinedModel(nn.Module):
+    def __init__(self, gnn_encoder, classifier):
+        super(CombinedModel, self).__init__()
+        self.gnn_encoder = gnn_encoder
+        self.classifier = classifier
+
+    def encode(self, *args, **kwargs):
+        return self.gnn_encoder(*args, **kwargs)
+
+    def classify(self, encoded):
+        return self.classifier(encoded)
+
+    def forward(self, *args, **kwargs):
+        encoded = self.encode(*args, **kwargs)
+        return self.classify(encoded)
+
 class PromptGenerator(nn.Module):
     def __init__(self, input_dim, hidden_dim):
         super().__init__()
@@ -105,3 +120,4 @@ class PromptGenerator(nn.Module):
     
     def forward(self, x):
         return self.mlp(x)
+

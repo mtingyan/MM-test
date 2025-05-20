@@ -124,7 +124,37 @@ class TemporalDataSplitter:
             test_time_list.append([start, end])
 
         return val_time, test_time_list
+
+
+
+def compute_degree_prompt(prev_degrees, curr_degrees, num_buckets=10):
+    # 计算度的变化
+    degree_changes = curr_degrees - prev_degrees
     
+    # 将度的变化分桶
+    min_change = degree_changes.min()
+    max_change = degree_changes.max()
+    bucket_size = (max_change - min_change) / num_buckets
+    
+    # 将每个节点的度变化映射到相应的桶
+    bucketed_changes = torch.floor((degree_changes - min_change) / bucket_size).long()
+    
+    # 将桶索引转换为one-hot向量
+    one_hot_changes = F.one_hot(bucketed_changes, num_classes=num_buckets)
+    
+    return one_hot_changes.float()
+
+def add_time_features(x, edge_index, time_feature, num_nodes, time_dim):
+    time_features_norm = time_feature / time_feature.max()
+    bins = torch.linspace(0, 1, steps=time_dim + 1)
+    bucket_indices = torch.bucketize(time_features_norm.squeeze(-1), bins) - 1
+    time_based_features = torch.zeros((num_nodes, time_dim), dtype=torch.float32)
+    for edge, bucket in zip(edge_index.T, bucket_indices):
+        source, target = edge[0].item(), edge[1].item()
+        time_based_features[source, bucket] = 1
+        time_based_features[target, bucket] = 1
+    x = torch.cat([x, time_based_features], dim=1)
+    return x
 
 def compute_node_degrees(edge_index, num_nodes):
     degrees = torch.zeros(num_nodes, dtype=torch.long)
@@ -132,6 +162,29 @@ def compute_node_degrees(edge_index, num_nodes):
         degrees[node] += 1
     return degrees
 
+def add_degree_features(x, edge_index, num_nodes, degree_dim):
+    degrees = compute_node_degrees(edge_index, num_nodes)
+    bins = torch.linspace(0, degrees.max() + 1, steps=degree_dim + 1)
+    bucket_indices = torch.bucketize(degrees, bins) - 1
+    bucket_indices = torch.clamp(bucket_indices, min=0)
+    one_hot_features = torch.nn.functional.one_hot(bucket_indices, num_classes=degree_dim).float()
+    x = torch.cat([x, one_hot_features], dim=1)
+    return x
+
+def add_temporal_structure_features(x, edge_index, time_feature, num_nodes, tss_dim):
+    time_features_norm = time_feature / time_feature.max()
+    bins = torch.linspace(0, 1, steps=tss_dim + 1)
+    bucket_indices = torch.bucketize(time_features_norm.squeeze(-1), bins) - 1
+    time_based_features = torch.zeros((num_nodes, tss_dim), dtype=torch.float32)
+    for edge, bucket in zip(edge_index.T, bucket_indices):
+        source, target = edge[0].item(), edge[1].item()
+        time_based_features[source, bucket] += 1
+        time_based_features[target, bucket] += 1
+    time_features_norm = time_based_features / time_based_features.max()
+    # col_sums = time_based_features.sum(dim=0, keepdim=True)
+    # time_based_features = torch.div(time_based_features, col_sums + 1e-8)  # Avoid division by zero
+    x = torch.cat([x, time_features_norm], dim=1)
+    return x
 
 def create_ba_random_graph(args, raw_data_path):
     """Create a Barabási-Albert random graph with evolving structure."""

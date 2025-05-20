@@ -9,12 +9,10 @@ import torch.nn.functional as F
 from torch_geometric.utils import negative_sampling
 
 from data_preprocess import EvolvingDataset, DataSplitter
-from models import CombinedModel, LinkPredictor, PromptGenerator, GNNEncoder
+from models import CombinedModel, NodeClassifier,  NodeRegressor, PromptGenerator, GNNEncoder
 from utils import EarlyStopping, load_config, TemporalDataSplitter, get_link_labels, set_seed, compute_node_degrees
 
-TEST_K = 10
-TEST_BATCH_SIZE = 1024
-
+MRE_EPSILON = 1e-7
 
 def compute_feature_prompt(h_prev, h_curr, bins=5, eps=1e-8, clip_max=10.0):
     # 计算 softmax 并添加数值稳定性
@@ -156,7 +154,7 @@ def evaluate(args, model, prompt_generator, dataset, time_periods):
         
     return scores_list
 
-def predict_links(args):
+def predict_node_labels(args):
     set_seed(args.seed)
 
     dataset = EvolvingDataset(args)
@@ -166,11 +164,16 @@ def predict_links(args):
     print("Test data:")
     for i, test_time in enumerate(test_time_list):
         print(f"Test time {i + 1}: {test_time}")
-
-    classifier = LinkPredictor(
-        hidden_dim=args.hidden_dim,
-        output_dim=args.output_dim
-    ).to(args.device)
+    if args.dataset in ["ogbn-arxiv", "SBM", 'penn', 'Amherst41', 'Cornell5', 'Johns_Hopkins55', 'Reed98']:
+        classifier = NodeClassifier(
+            hidden_dim=args.hidden_dim,
+            output_dim=args.output_dim
+        ).to(args.device)
+    elif args.dataset in ["BA-random"]:
+        classifier = NodeRegressor(
+            hidden_dim=args.hidden_dim,
+            output_dim=args.output_dim
+        ).to(args.device)       
 
     gnn_encoder = GNNEncoder(
         input_dim=args.input_dim + args.pt_dim,
@@ -198,7 +201,7 @@ def predict_links(args):
     prompt_generator_name = f"{args.dataset}_prompt_generator_{args.backbone}_{args.seed}_best_model.pth"
     prompt_optimizer = torch.optim.Adam(prompt_generator.parameters(), lr=args.learning_rate)
     
-    criterion = torch.nn.BCEWithLogitsLoss()
+    criterion = torch.nn.L1Loss()
 
     train_data = dataset.build_graph(train_time[0], train_time[1])
     for epoch in range(args.epochs):
@@ -211,7 +214,7 @@ def predict_links(args):
         # 2. 获取训练数据
         splitter = DataSplitter(args, train_data)
         splits = splitter.load_or_create_splits()
-        train_edge_index = train_data.edge_index[:,splits["train_mask"]]
+        train_edge_index = train_data.edge_index[:,splits["train_edge_mask"]]
         x = train_data.x.to(args.device)
         num_nodes = x.size(0)
         edge_times = train_data.edge_time[splits["train_mask"]]
@@ -228,7 +231,10 @@ def predict_links(args):
         splits_indices = [i * split_size for i in range(k)] + [num_edges]
         
         tr_loss = 0
+        consistency_loss = 0
+        contrastive_loss = 0
         for i in range(1, k):
+
             prompt = torch.zeros((num_nodes, args.pt_dim))
             x_aug = torch.cat([x, prompt], dim=-1)
             
@@ -240,8 +246,12 @@ def predict_links(args):
             d_curr = compute_node_degrees(train_edge_index[:, :splits_indices[i]], num_nodes)
             d_prompt = compute_degree_prompt(d_prev, d_curr, num_buckets=args.degree_dim)
 
+            consistency_loss += F.mse_loss()
             prompt = torch.cat([f_prompt, d_prompt], dim=-1).to(args.device)
             prompt = prompt_generator(prompt)
+            if i != 1:
+                consistency_loss += F.mse_loss(prompt, last_prompt)
+            last_prompt = prompt
             neg_edge_index = negative_sampling(
                 edge_index=train_edge_index[:, :splits_indices[i]],
                 num_nodes=num_nodes,
@@ -256,9 +266,15 @@ def predict_links(args):
             edge_index = torch.cat([train_edge_index[:, :splits_indices[i]].to(args.device), neg_edge_index.to(args.device)], dim=-1).long()
             link_logits = model.decode(z, edge_index)
             tr_loss += criterion(link_logits, link_labels)
+            pos_score = F.cosine_similarity(prompt[train_edge_index[:, :splits_indices[i]][0]], prompt[train_edge_index[:, :splits_indices[i]][1]])
+            neg_score = F.cosine_similarity(prompt[neg_edge_index[0]], prompt[neg_edge_index[1]])
+            contrastive_loss += torch.mean(F.relu(neg_score - pos_score + args.margin))
 
         tr_loss /= k - 1
-        tr_loss.backward()
+        consistency_loss /= k - 2
+        contrastive_loss /= k - 1
+        total_loss = tr_loss + args.consistency_weight * consistency_loss + args.contrastive_weight * contrastive_loss
+        total_loss.backward()
         optimizer.step()
         prompt_optimizer.step()
 
